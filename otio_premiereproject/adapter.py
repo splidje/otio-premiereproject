@@ -3,6 +3,7 @@ __doc__ = """OpenTimelineIO Adobe Premiere Project Adapter"""
 from xml.etree import ElementTree as ET
 import gzip
 from copy import deepcopy
+import base64
 
 import opentimelineio as otio
 
@@ -12,9 +13,16 @@ class AdobePremiereProjectParseError(otio.exceptions.OTIOError):
 
 
 def read_from_file(filepath):
+    if hasattr(gzip, 'BadGzipFile'):
+        exc_type = gzip.BadGzipFile
+    else:
+        exc_type = IOError
     try:
         input_str = gzip.GzipFile(filepath).read()
-    except gzip.BadGzipFile:
+    except exc_type as e:
+        if exc_type is IOError:
+            if e.message != 'Not a gzipped file':
+                raise
         input_str = open(filepath).read()
     return read_from_string(input_str)
 
@@ -47,7 +55,7 @@ class AdobePremiereProject(object):
     def _get_object(self, id_, attr_name="ObjectID"):
         if id_ not in self._object_cache:
             node = self._root.find("*[@{}='{}']".format(attr_name, id_))
-            if not node:
+            if node is None or not len(node):
                 raise AdobePremiereProjectParseError(
                     "Couldn't find object with {} {}".format(attr_name, id_)
                 )
@@ -140,40 +148,17 @@ class AdobePremiereProject(object):
                     media_node_ref = media_source_node.find("MediaSource/Media")
                     if media_node_ref is not None:
                         media_node = self._udereference(media_node_ref)
-                        media_path = media_node.find("ActualMediaFilePath").text
-                        media_start = otio.opentime.RationalTime(
-                            int(media_node.find("Start").text)
-                            / 254016000000
-                        ).rescaled_to(frame_rate)
-                        if track_kind == "Video":
-                            video_stream_node = self._dereference(
-                                media_node.find("VideoStream")
+                        # could it be a generator rather than a file?
+                        importer_prefs_node = media_node.find("ImporterPrefs")
+                        if importer_prefs_node is not None:
+                            media_reference = self._generator_reference_from_media_node(
+                                media_node, importer_prefs_node
                             )
-                            media_duration = otio.opentime.RationalTime(
-                                int(video_stream_node.find("Duration").text)
-                                / 254016000000
-                            ).rescaled_to(frame_rate)
-                        elif track_kind == "Audio":
-                            video_stream_node = self._dereference(
-                                media_node.find("AudioStream")
-                            )
-                            media_duration = otio.opentime.RationalTime(
-                                int(video_stream_node.find("Duration").text)
-                                / 254016000000
-                            ).rescaled_to(frame_rate)
                         else:
-                            raise NotImplementedError(
-                                "Can only handle Video or Audio here atm."
+                            media_reference = self._external_reference_from_media_node(
+                                media_node, track_kind, frame_rate
                             )
-                        clip = otio.schema.Clip(
-                            media_reference=otio.schema.ExternalReference(
-                                target_url=media_path,
-                                available_range=otio.opentime.TimeRange(
-                                    start_time=media_start,
-                                    duration=media_duration,
-                                ),
-                            ),
-                        )
+                        clip = otio.schema.Clip(media_reference=media_reference)
                     else:
                         sequence_node_ref = media_source_node.find(
                             "SequenceSource/Sequence"
@@ -206,3 +191,48 @@ class AdobePremiereProject(object):
                     last_track_end = track_end
                 stack.append(track)
         return stack
+
+    def _external_reference_from_media_node(self, media_node, track_kind, frame_rate):
+        media_name = media_node.find("Title").text
+        media_start = otio.opentime.RationalTime(
+            int(media_node.find("Start").text)
+            / 254016000000
+        ).rescaled_to(frame_rate)
+        if track_kind == "Video":
+            video_stream_node = self._dereference(
+                media_node.find("VideoStream")
+            )
+            media_duration = otio.opentime.RationalTime(
+                int(video_stream_node.find("Duration").text)
+                / 254016000000
+            ).rescaled_to(frame_rate)
+        elif track_kind == "Audio":
+            video_stream_node = self._dereference(
+                media_node.find("AudioStream")
+            )
+            media_duration = otio.opentime.RationalTime(
+                int(video_stream_node.find("Duration").text)
+                / 254016000000
+            ).rescaled_to(frame_rate)
+        else:
+            raise NotImplementedError(
+                "Can only handle Video or Audio here atm."
+            )
+        return otio.schema.ExternalReference(
+            target_url=media_name,
+            available_range=otio.opentime.TimeRange(
+                start_time=media_start,
+                duration=media_duration,
+            ),
+        )
+
+    def _generator_reference_from_media_node(self, media_node, importer_prefs_node):
+        return otio.schema.GeneratorReference(
+            name=media_node.find("Title").text,
+            generator_kind="premiere_generator",
+            parameters=dict(
+                importer_prefs=base64.b64decode(
+                    importer_prefs_node.text
+                ),
+            ),
+        )
