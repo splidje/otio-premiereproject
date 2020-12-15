@@ -186,10 +186,21 @@ class AdobePremiereProject(object):
                     )
                     playback_speed_node = clip_node.find("PlaybackSpeed")
                     if playback_speed_node is not None:
+                        speed = float(playback_speed_node.text)
                         clip.effects.append(
                             otio.schema.LinearTimeWarp(
-                                time_scalar=float(playback_speed_node.text),
+                                time_scalar=speed,
                             )
+                        )
+                        # set clip source range accordingly
+                        time_transform = otio.opentime.TimeTransform(
+                            scale=1 / speed,
+                        )
+                        clip.source_range = otio.opentime.TimeRange(
+                            start_time=clip.source_range.start_time,
+                            duration=time_transform.applied_to(
+                                clip.source_range.duration,
+                            ),
                         )
                     track.append(clip)
                     last_track_end = track_end
