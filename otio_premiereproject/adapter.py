@@ -8,6 +8,17 @@ import base64
 import opentimelineio as otio
 
 
+PREMIERE_TICKS_PER_SECOND = 254016000000
+
+
+def premiere_ticks_to_secs(t):
+    return t / PREMIERE_TICKS_PER_SECOND
+
+
+def premiere_ticks_to_fps(t):
+    return PREMIERE_TICKS_PER_SECOND / t
+
+
 class AdobePremiereProjectParseError(otio.exceptions.OTIOError):
     pass
 
@@ -89,17 +100,26 @@ class AdobePremiereProject(object):
         top_track_group_nodes = self._dereference_all(
             sequence_node.findall("TrackGroups/TrackGroup/Second")
         )
+        premiere_sequence_frame_rate = next(
+            (
+                int(n.find("TrackGroup/FrameRate").text)
+                for n in top_track_group_nodes
+                if n.tag == "VideoTrackGroup"
+            ),
+            None,
+        )
+        if premiere_sequence_frame_rate is not None:
+            stack.metadata['premiere'] = dict(
+                frame_rate=premiere_sequence_frame_rate,
+            )
         frame_rate = self._frame_rate
         if frame_rate is None:
-            frame_rate = next(
-                (
-                    254016000000
-                    / int(n.find("TrackGroup/FrameRate").text)
-                    for n in top_track_group_nodes
-                    if n.tag == "VideoTrackGroup"
-                ),
-                25,
-            )
+            if premiere_sequence_frame_rate is not None:
+                frame_rate = premiere_ticks_to_fps(
+                    premiere_sequence_frame_rate
+                )
+            else:
+                frame_rate = 25
         for top_track_group_node in top_track_group_nodes:
             for track_node in self._dereference_all(
                 top_track_group_node.findall("TrackGroup/Tracks/Track")
@@ -121,8 +141,10 @@ class AdobePremiereProject(object):
                 ):
                     clip_track_item_node = top_track_item_node.find("ClipTrackItem")
                     track_item_node = clip_track_item_node.find("TrackItem")
-                    track_start = int(track_item_node.find("Start").text) / 254016000000
-                    track_end = int(track_item_node.find("End").text) / 254016000000
+                    premiere_track_start = int(track_item_node.find("Start").text)
+                    premiere_track_end = int(track_item_node.find("End").text)
+                    track_start = premiere_ticks_to_secs(premiere_track_start)
+                    track_end = premiere_ticks_to_secs(premiere_track_end)
                     if track_start > last_track_end:
                         track.append(
                             otio.schema.Gap(
@@ -136,13 +158,13 @@ class AdobePremiereProject(object):
                     )
                     top_clip_node = self._dereference(sub_clip_node.find("Clip"))
                     clip_node = top_clip_node.find("Clip")
+                    premiere_clip_in = int(clip_node.find("InPoint").text)
+                    premiere_clip_out = int(clip_node.find("OutPoint").text)
                     clip_in = otio.opentime.RationalTime(
-                        int(clip_node.find("InPoint").text)
-                        / 254016000000
+                        premiere_ticks_to_secs(premiere_clip_in)
                     ).rescaled_to(frame_rate)
                     clip_out = otio.opentime.RationalTime(
-                        int(clip_node.find("OutPoint").text)
-                        / 254016000000
+                        premiere_ticks_to_secs(premiere_clip_out)
                     ).rescaled_to(frame_rate)
                     media_source_node = self._dereference(clip_node.find("Source"))
                     media_node_ref = media_source_node.find("MediaSource/Media")
@@ -169,6 +191,12 @@ class AdobePremiereProject(object):
                         start_time=clip_in,
                         duration=clip_out - clip_in,
                     )
+                    clip.metadata['premiere'] = dict(
+                        track_start=premiere_track_start,
+                        track_end=premiere_track_end,
+                        clip_in=premiere_clip_in,
+                        clip_out=premiere_clip_out,
+                    )
                     playback_speed_node = clip_node.find("PlaybackSpeed")
                     if playback_speed_node is not None:
                         speed = float(playback_speed_node.text)
@@ -194,35 +222,36 @@ class AdobePremiereProject(object):
 
     def _external_reference_from_media_node(self, media_node, track_kind, frame_rate):
         media_name = media_node.find("Title").text
+        premiere_media_start = int(media_node.find("Start").text)
         media_start = otio.opentime.RationalTime(
-            int(media_node.find("Start").text)
-            / 254016000000
+            premiere_ticks_to_secs(premiere_media_start)
         ).rescaled_to(frame_rate)
         if track_kind == "Video":
-            video_stream_node = self._dereference(
-                media_node.find("VideoStream")
-            )
-            media_duration = otio.opentime.RationalTime(
-                int(video_stream_node.find("Duration").text)
-                / 254016000000
-            ).rescaled_to(frame_rate)
+            stream_node_name = "VideoStream"
         elif track_kind == "Audio":
-            video_stream_node = self._dereference(
-                media_node.find("AudioStream")
-            )
-            media_duration = otio.opentime.RationalTime(
-                int(video_stream_node.find("Duration").text)
-                / 254016000000
-            ).rescaled_to(frame_rate)
+            stream_node_name = "AudioStream"
         else:
             raise NotImplementedError(
                 "Can only handle Video or Audio here atm."
             )
+        stream_node = self._dereference(
+            media_node.find(stream_node_name)
+        )
+        premiere_media_duration = int(stream_node.find("Duration").text)
+        media_duration = otio.opentime.RationalTime(
+            premiere_ticks_to_secs(premiere_media_duration)
+        ).rescaled_to(frame_rate)
         return otio.schema.ExternalReference(
             target_url=media_name,
             available_range=otio.opentime.TimeRange(
                 start_time=media_start,
                 duration=media_duration,
+            ),
+            metadata=dict(
+                premiere=dict(
+                    media_start=premiere_media_start,
+                    media_duration=premiere_media_duration,
+                ),
             ),
         )
 
