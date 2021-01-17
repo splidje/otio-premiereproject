@@ -19,31 +19,54 @@ def premiere_ticks_to_fps(t):
     return PREMIERE_TICKS_PER_SECOND / t
 
 
+def round_rational_time(rt):
+    return otio.opentime.RationalTime(
+        round(rt.value),
+        rt.rate,
+    )
+
+
 class AdobePremiereProjectParseError(otio.exceptions.OTIOError):
     pass
 
 
-def read_from_file(filepath):
+def read_from_file(filepath, sequence_name=None):
     if hasattr(gzip, 'BadGzipFile'):
         exc_type = gzip.BadGzipFile
     else:
         exc_type = IOError
+    was_gzipped = False
     try:
         input_str = gzip.GzipFile(filepath).read()
+        was_gzipped = True
     except exc_type as e:
         if exc_type is IOError:
             if e.message != 'Not a gzipped file':
                 raise
         input_str = open(filepath).read()
-    return read_from_string(input_str)
+    try:
+        return read_from_string(input_str, sequence_name=sequence_name)
+    except AdobePremiereProjectParseError as e:
+        if not was_gzipped:
+            raise
+        raise AdobePremiereProjectParseError("File is GZipped, but the data with is unrecognised: {}".format(e))
 
 
-def read_from_string(input_str):
+def read_from_string(input_str, sequence_name=None):
     try:
         root = ET.fromstring(input_str)
-    except ET.ParseError:
-        raise AdobePremiereProjectParseError("Data is neither XML nor gzipped XML.")
-    return AdobePremiereProject(root).to_collection()
+    except ET.ParseError as e:
+        raise AdobePremiereProjectParseError("Data is not XML: {}".format(e))
+    collection = AdobePremiereProject(root).to_collection()
+    if sequence_name:
+        timeline = next(
+            (t for t in collection if t.name == sequence_name),
+            None,
+        )
+        if timeline is None:
+            raise KeyError("No sequence named: {}".format(sequence_name))
+        return timeline
+    return collection
 
 
 class AdobePremiereProject(object):
@@ -74,20 +97,16 @@ class AdobePremiereProject(object):
         return self._object_cache[id_]
 
     def _dereference(self, node):
+        attr_name = "ObjectID"
         id_ = node.get("ObjectRef")
         if not id_:
-            raise AdobePremiereProjectParseError(
-                "Node has no ObjectRef attribute: {}".format(node)
-            )
-        return self._get_object(id_)
-
-    def _udereference(self, node):
-        uid = node.get("ObjectURef")
-        if not uid:
-            raise AdobePremiereProjectParseError(
-                "Node has no ObjectURef attribute: {}".format(node)
-            )
-        return self._get_object(uid, "ObjectUID")
+            attr_name = "ObjectUID"
+            id_ = node.get("ObjectURef")
+            if not id_:
+                raise AdobePremiereProjectParseError(
+                    "Node has neither ObjectRef nor ObjectURef attribute: {}".format(node)
+                )
+        return self._get_object(id_, attr_name)
 
     def _dereference_all(self, nodes):
         return [
@@ -134,7 +153,9 @@ class AdobePremiereProject(object):
                             track_node.tag, track_node.get("ObjectID")
                         )
                     )
-                track = otio.schema.Track(kind=track_kind)
+                track = otio.schema.Track(
+                    kind=track_kind,
+                )
                 last_track_end = 0
                 for top_track_item_node in self._dereference_all(
                     track_node.findall("ClipTrack/ClipItems/TrackItems/TrackItem")
@@ -148,9 +169,11 @@ class AdobePremiereProject(object):
                     if track_start > last_track_end:
                         track.append(
                             otio.schema.Gap(
-                                duration=otio.opentime.RationalTime(
-                                    track_start - last_track_end
-                                ).rescaled_to(frame_rate)
+                                duration=round_rational_time(
+                                    otio.opentime.RationalTime(
+                                        track_start - last_track_end
+                                    ).rescaled_to(frame_rate)
+                                ),
                             )
                         )
                     sub_clip_node = self._dereference(
@@ -160,36 +183,39 @@ class AdobePremiereProject(object):
                     clip_node = top_clip_node.find("Clip")
                     premiere_clip_in = int(clip_node.find("InPoint").text)
                     premiere_clip_out = int(clip_node.find("OutPoint").text)
-                    clip_in = otio.opentime.RationalTime(
-                        premiere_ticks_to_secs(premiere_clip_in)
-                    ).rescaled_to(frame_rate)
-                    clip_out = otio.opentime.RationalTime(
-                        premiere_ticks_to_secs(premiere_clip_out)
-                    ).rescaled_to(frame_rate)
+                    clip_in = round_rational_time(
+                        otio.opentime.RationalTime(
+                            premiere_ticks_to_secs(premiere_clip_in)
+                        ).rescaled_to(frame_rate)
+                    )
                     media_source_node = self._dereference(clip_node.find("Source"))
                     media_node_ref = media_source_node.find("MediaSource/Media")
                     if media_node_ref is not None:
-                        media_node = self._udereference(media_node_ref)
+                        media_node = self._dereference(media_node_ref)
                         # could it be a generator rather than a file?
-                        importer_prefs_node = media_node.find("ImporterPrefs")
-                        if importer_prefs_node is not None:
-                            media_reference = self._generator_reference_from_media_node(
-                                media_node, importer_prefs_node
-                            )
-                        else:
+                        file_key = media_node.find("FileKey").text
+                        if file_key:
                             media_reference = self._external_reference_from_media_node(
                                 media_node, track_kind, frame_rate
+                            )
+                        else:
+                            media_reference = self._generator_reference_from_media_node(
+                                media_node
                             )
                         clip = otio.schema.Clip(media_reference=media_reference)
                     else:
                         sequence_node_ref = media_source_node.find(
                             "SequenceSource/Sequence"
                         )
-                        sequence_node = self._udereference(sequence_node_ref)
+                        sequence_node = self._dereference(sequence_node_ref)
                         clip = self._stack_from_sequence_node(sequence_node)
                     clip.source_range = otio.opentime.TimeRange(
                         start_time=clip_in,
-                        duration=clip_out - clip_in,
+                        duration=round_rational_time(
+                            otio.opentime.RationalTime(
+                                track_end - track_start
+                            ).rescaled_to(frame_rate)
+                        ),
                     )
                     clip.metadata['premiere'] = dict(
                         track_start=premiere_track_start,
@@ -205,16 +231,6 @@ class AdobePremiereProject(object):
                                 time_scalar=speed,
                             )
                         )
-                        # set clip source range accordingly
-                        time_transform = otio.opentime.TimeTransform(
-                            scale=1 / speed,
-                        )
-                        clip.source_range = otio.opentime.TimeRange(
-                            start_time=clip.source_range.start_time,
-                            duration=time_transform.applied_to(
-                                clip.source_range.duration,
-                            ),
-                        )
                     track.append(clip)
                     last_track_end = track_end
                 stack.append(track)
@@ -222,10 +238,15 @@ class AdobePremiereProject(object):
 
     def _external_reference_from_media_node(self, media_node, track_kind, frame_rate):
         media_name = media_node.find("Title").text
-        premiere_media_start = int(media_node.find("Start").text)
-        media_start = otio.opentime.RationalTime(
-            premiere_ticks_to_secs(premiere_media_start)
-        ).rescaled_to(frame_rate)
+        start_node = media_node.find("Start")
+        if start_node:
+            premiere_media_start = int(start_node.text)
+            media_start = otio.opentime.RationalTime(
+                premiere_ticks_to_secs(premiere_media_start)
+            ).rescaled_to(frame_rate)
+        else:
+            premiere_media_start = None
+            media_start = otio.opentime.RationalTime(0, frame_rate)
         if track_kind == "Video":
             stream_node_name = "VideoStream"
         elif track_kind == "Audio":
@@ -255,13 +276,16 @@ class AdobePremiereProject(object):
             ),
         )
 
-    def _generator_reference_from_media_node(self, media_node, importer_prefs_node):
-        return otio.schema.GeneratorReference(
+    def _generator_reference_from_media_node(self, media_node):
+        gen_ref = otio.schema.GeneratorReference(
             name=media_node.find("Title").text,
             generator_kind="premiere_generator",
-            parameters=dict(
+        )
+        importer_prefs_node = media_node.find("ImporterPrefs")
+        if importer_prefs_node is not None and importer_prefs_node.text is not None:
+            gen_ref.parameters = dict(
                 importer_prefs=base64.b64decode(
                     importer_prefs_node.text
                 ),
-            ),
-        )
+            )
+        return gen_ref
