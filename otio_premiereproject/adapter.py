@@ -283,7 +283,7 @@ class AdobePremiereProject(object):
         )
         importer_prefs_node = media_node.find("ImporterPrefs")
         if importer_prefs_node is not None and importer_prefs_node.text is not None:
-            gen_ref.parameters = dict(
+            gen_ref.parameters.update(
                 importer_prefs=base64.b64decode(
                     importer_prefs_node.text
                 ),
